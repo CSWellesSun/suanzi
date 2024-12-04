@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Tuple
+import torch.nn.functional as F
 
 dtype = torch.float32
 device = 'cuda:0'
@@ -149,6 +150,54 @@ def conv2d_triton(
 
     return output
 
+def get_im2col_indices(x_shape, field_height, field_width, padding=0, stride=1):
+    N, C, H, W = x_shape
+    assert (H + 2 * padding - field_height) % stride == 0
+    assert (W + 2 * padding - field_height) % stride == 0
+    out_height = (H + 2 * padding - field_height) // stride + 1
+    out_width = (W + 2 * padding - field_width) // stride + 1
+
+    i0 = torch.repeat_interleave(torch.arange(field_height), field_width)
+    i0 = i0.repeat(C)
+    i1 = stride * torch.repeat_interleave(torch.arange(out_height), out_width)
+    j0 = torch.arange(field_width).repeat(field_height * C)
+    j1 = stride * torch.arange(out_width).repeat(out_height)
+    i = i0.view(-1, 1) + i1.view(1, -1)
+    j = j0.view(-1, 1) + j1.view(1, -1)
+
+    k = torch.arange(C).repeat_interleave(field_height * field_width).view(-1, 1)
+
+    return (k, i, j)
+
+def im2col_indices(x, field_height, field_width, padding=0, stride=1):
+    p = padding
+    x_padded = F.pad(x, (p, p, p, p))
+
+    k, i, j = get_im2col_indices(x.shape, field_height, field_width, padding, stride)
+
+    cols = x_padded[:, k, i, j]
+    C = x.shape[1]
+    cols = cols.permute(1, 2, 0).reshape(field_height * field_width * C, -1)
+    return cols
+
+def conv2d_im2col(x, w, b, stride=1, pad=0):
+    N, C, H, W = x.shape
+    num_filters, _, filter_height, filter_width = w.shape
+
+    assert (W + 2 * pad - filter_width) % stride == 0, 'width does not work'
+    assert (H + 2 * pad - filter_height) % stride == 0, 'height does not work'
+
+    out_height = (H + 2 * pad - filter_height) // stride + 1
+    out_width = (W + 2 * pad - filter_width) // stride + 1
+    out = torch.zeros((N, num_filters, out_height, out_width), dtype=x.dtype)
+
+    x_cols = im2col_indices(x, w.shape[2], w.shape[3], pad, stride)
+    res = w.view(w.shape[0], -1).mm(x_cols) + b.view(-1, 1)
+
+    out = res.view(w.shape[0], out.shape[2], out.shape[3], x.shape[0])
+    out = out.permute(3, 0, 1, 2)
+
+    return out
 
 class Conv2DTriton(torch.nn.Module):
     def __init__(self, in_channels:int, out_channels: int, kernel_size: Tuple):
@@ -197,7 +246,7 @@ if __name__ == '__main__':
         conv_layer.bias.copy_(bias)
 
     y_torch = conv_layer(input)
-    y_triton = conv2d_triton(input, kernel, bias)
+    y_triton = conv2d_im2col(input, kernel, bias, stride=kernel_height)
 
     print(f'Original matrix:\n{input}')
     print(f'PyTorch Conv2d:\n{y_torch}')
@@ -257,7 +306,7 @@ if __name__ == '__main__':
         quantiles = [0.5, 0.2, 0.8]
 
         if provider == 'triton':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: conv2d_triton(input, kernel, bias), quantiles=quantiles)
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: conv2d_im2col(input, kernel, bias, stride=kernel_height), quantiles=quantiles)
         if provider == 'torch':
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: conv_layer(input), quantiles=quantiles)
 
